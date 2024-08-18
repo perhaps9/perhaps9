@@ -4,6 +4,9 @@ const express = require('express');
 const { readSecret, SECRET_KEYS } = require('./secrets');
 const { getConfigValue, uuidv4 } = require('../util');
 const { jsonParser } = require('../express-common');
+const iconv = require('iconv-lite');
+const { generateRequestUrl, normaliseResponse } = require('google-translate-api-browser');
+const bodyParser = require('body-parser');
 
 const DEEPLX_URL_DEFAULT = 'http://127.0.0.1:1188/translate';
 const ONERING_URL_DEFAULT = 'http://127.0.0.1:4990/translate';
@@ -65,39 +68,88 @@ router.post('/libre', jsonParser, async (request, response) => {
     }
 });
 
+
 router.post('/google', jsonParser, async (request, response) => {
     try {
         const { generateRequestUrl, normaliseResponse } = require('google-translate-api-browser');
-        const text = request.body.text;
+        let text = request.body.text;
         const lang = request.body.lang;
 
         if (!text || !lang) {
             return response.sendStatus(400);
         }
 
-        console.log('Input text: ' + text);
+        console.log('Input text:', text);
+        //console.log('----------');
+
+        // Apply formatting only if the translation language is Russian
+        if (lang === 'ru') {
+             // Replace quotation marks and asterisks with special markers before translating
+            const openQuote = '__OPEN_QUOTE__ ';
+            const closeQuote = ' __CLOSE_QUOTE__';
+            const openStar = '__OPEN_STAR__ ';
+            const closeStar = ' __CLOSE_STAR__';
+             // A very rare case
+            const very_rare_execption = '__OPEN_STAR__, ';
+
+            // Use counters to alternate between opening and closing markers
+            let quoteCounter = 0;
+            let starCounter = 0;
+
+            text = text.replace(/"/g, () => (quoteCounter++ % 2 === 0 ? openQuote : closeQuote));
+            text = text.replace(/\*/g, () => (starCounter++ % 2 === 0 ? openStar : closeStar));
+
+            //console.log('Pre-Input text:', text);
+            //console.log('----------');
+        }
 
         const url = generateRequestUrl(text, { to: lang });
 
         https.get(url, (resp) => {
-            let data = '';
+            let data = [];
 
             resp.on('data', (chunk) => {
-                data += chunk;
+                data.push(chunk);
             });
 
             resp.on('end', () => {
                 try {
-                    const result = normaliseResponse(JSON.parse(data));
-                    console.log('Translated text: ' + result.text);
-                    return response.send(result.text);
+                    let result;
+                    if (lang === 'ru') {
+                        // Decoding for Russian language
+                        const decodedData = iconv.decode(Buffer.concat(data), 'utf-8');
+                        result = normaliseResponse(JSON.parse(decodedData));
+                    } else {
+                        // For other languages, we use the data as is
+                        result = normaliseResponse(JSON.parse(Buffer.concat(data).toString()));
+                    }
+
+                    //console.log('Pre-Translated text:', result.text);
+                    //console.log('----------');
+
+                    let fixedText = result.text;
+
+                    // Restore formatting only if the target language is Russian
+                    if (lang === 'ru') {
+                        fixedText = result.text
+                            .replace(new RegExp('__OPEN_QUOTE__ ', 'g'), '"')
+                            .replace(new RegExp(' __CLOSE_QUOTE__', 'g'), '"')
+                            .replace(new RegExp('__OPEN_STAR__ ', 'g'), '*')
+                            .replace(new RegExp(' __CLOSE_STAR__', 'g'), '*')
+                            .replace(new RegExp('__OPEN_STAR__, ', 'g'), '*');
+                    }
+
+                    console.log('Translated text:', fixedText);
+
+                    response.setHeader('Content-Type', 'text/plain; charset=utf-8');
+                    return response.send(fixedText);
                 } catch (error) {
                     console.log('Translation error', error);
                     return response.sendStatus(500);
                 }
             });
         }).on('error', (err) => {
-            console.log('Translation error: ' + err.message);
+            console.log('Translation error:', err.message);
             return response.sendStatus(500);
         });
     } catch (error) {
@@ -105,6 +157,9 @@ router.post('/google', jsonParser, async (request, response) => {
         return response.sendStatus(500);
     }
 });
+
+
+
 
 router.post('/yandex', jsonParser, async (request, response) => {
     const chunks = request.body.chunks;
