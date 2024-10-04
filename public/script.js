@@ -246,6 +246,7 @@ import { initInputMarkdown } from './scripts/input-md-formatting.js';
 import { AbortReason } from './scripts/util/AbortReason.js';
 import { initSystemPrompts } from './scripts/sysprompt.js';
 import { registerExtensionSlashCommands as initExtensionSlashCommands } from './scripts/extensions-slashcommands.js';
+import { ToolManager } from './scripts/tool-calling.js';
 
 //exporting functions and vars for mods
 export {
@@ -463,8 +464,6 @@ export const event_types = {
     FILE_ATTACHMENT_DELETED: 'file_attachment_deleted',
     WORLDINFO_FORCE_ACTIVATE: 'worldinfo_force_activate',
     OPEN_CHARACTER_LIBRARY: 'open_character_library',
-    LLM_FUNCTION_TOOL_REGISTER: 'llm_function_tool_register',
-    LLM_FUNCTION_TOOL_CALL: 'llm_function_tool_call',
     ONLINE_STATUS_CHANGED: 'online_status_changed',
     IMAGE_SWIPED: 'image_swiped',
     CONNECTION_PROFILE_LOADED: 'connection_profile_loaded',
@@ -2922,6 +2921,7 @@ class StreamingProcessor {
         this.swipes = [];
         /** @type {import('./scripts/logprobs.js').TokenLogprobs[]} */
         this.messageLogprobs = [];
+        this.toolCalls = [];
     }
 
     #checkDomElements(messageId) {
@@ -2930,6 +2930,13 @@ class StreamingProcessor {
             this.messageTextDom = this.messageDom?.querySelector('.mes_text');
             this.messageTimerDom = this.messageDom?.querySelector('.mes_timer');
             this.messageTokenCounterDom = this.messageDom?.querySelector('.tokenCounterDisplay');
+        }
+    }
+
+    #updateMessageBlockVisibility() {
+        if (this.messageDom instanceof HTMLElement && Array.isArray(this.toolCalls) && this.toolCalls.length > 0) {
+            const shouldHide = ['', '...'].includes(this.result);
+            this.messageDom.classList.toggle('displayNone', shouldHide);
         }
     }
 
@@ -2998,6 +3005,7 @@ class StreamingProcessor {
         }
         else {
             this.#checkDomElements(messageId);
+            this.#updateMessageBlockVisibility();
             const currentTime = new Date();
             // Don't waste time calculating token count for streaming
             const currentTokenCount = isFinal && power_user.message_token_count_enabled ? getTokenCount(processedText, 0) : 0;
@@ -3140,7 +3148,7 @@ class StreamingProcessor {
     }
 
     /**
-     * @returns {Generator<{ text: string, swipes: string[], logprobs: import('./scripts/logprobs.js').TokenLogprobs }, void, void>}
+     * @returns {Generator<{ text: string, swipes: string[], logprobs: import('./scripts/logprobs.js').TokenLogprobs, toolCalls: any[] }, void, void>}
      */
     *nullStreamingGeneration() {
         throw new Error('Generation function for streaming is not hooked up');
@@ -3162,12 +3170,13 @@ class StreamingProcessor {
         try {
             const sw = new Stopwatch(1000 / power_user.streaming_fps);
             const timestamps = [];
-            for await (const { text, swipes, logprobs } of this.generator()) {
+            for await (const { text, swipes, logprobs, toolCalls } of this.generator()) {
                 timestamps.push(Date.now());
                 if (this.isStopped) {
                     return;
                 }
 
+                this.toolCalls = toolCalls;
                 this.result = text;
                 this.swipes = Array.from(swipes ?? []);
                 if (logprobs) {
@@ -3571,7 +3580,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
     }
 
     // Collect messages with usable content
-    let coreChat = chat.filter(x => !x.is_system);
+    const canUseTools = ToolManager.isToolCallingSupported();
+    const canPerformToolCalls = !dryRun && ToolManager.canPerformToolCalls(type);
+    let coreChat = chat.filter(x => !x.is_system || (canUseTools && Array.isArray(x.extra?.tool_invocations)));
     if (type === 'swipe') {
         coreChat.pop();
     }
@@ -4406,6 +4417,26 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                 getMessage = continue_mag + getMessage;
             }
 
+            if (canPerformToolCalls && Array.isArray(streamingProcessor.toolCalls) && streamingProcessor.toolCalls.length) {
+                const invocationResult = await ToolManager.invokeFunctionTools(streamingProcessor.toolCalls);
+                if (invocationResult.hadToolCalls) {
+                    const lastMessage = chat[chat.length - 1];
+                    const shouldDeleteMessage = ['', '...'].includes(lastMessage?.mes) && ['', '...'].includes(streamingProcessor.result);
+                    shouldDeleteMessage && await deleteLastMessage();
+                    if (!invocationResult.invocations.length && shouldDeleteMessage) {
+                        ToolManager.showToolCallError(invocationResult.errors);
+                        unblockGeneration(type);
+                        generatedPromptCache = '';
+                        streamingProcessor = null;
+                        return;
+                    }
+
+                    streamingProcessor = null;
+                    ToolManager.saveFunctionToolInvocations(invocationResult.invocations);
+                    return Generate(type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName }, dryRun);
+                }
+            }
+
             if (streamingProcessor && !streamingProcessor.isStopped && streamingProcessor.isFinished) {
                 await streamingProcessor.onFinishStreaming(streamingProcessor.messageId, getMessage);
                 streamingProcessor = null;
@@ -4478,6 +4509,23 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
             // This relies on `saveReply` having been called to add the message to the chat, so it must be last.
             parseAndSaveLogprobs(data, continue_mag);
+        }
+
+        if (canPerformToolCalls) {
+            const invocationResult = await ToolManager.invokeFunctionTools(data);
+            if (invocationResult.hadToolCalls) {
+                const shouldDeleteMessage = ['', '...'].includes(getMessage);
+                shouldDeleteMessage && await deleteLastMessage();
+                if (!invocationResult.invocations.length && shouldDeleteMessage) {
+                    ToolManager.showToolCallError(invocationResult.errors);
+                    unblockGeneration(type);
+                    generatedPromptCache = '';
+                    return;
+                }
+
+                ToolManager.saveFunctionToolInvocations(invocationResult.invocations);
+                return Generate(type, { automatic_trigger, force_name2, quiet_prompt, quietToLoud, skipWIAN, force_chid, signal, quietImage, quietName }, dryRun);
+            }
         }
 
         if (type !== 'quiet') {
@@ -7854,7 +7902,7 @@ function openAlternateGreetings() {
             if (menu_type !== 'create') {
                 await createOrEditCharacter();
             }
-        }
+        },
     });
 
     for (let index = 0; index < getArray().length; index++) {
@@ -8131,6 +8179,10 @@ window['SillyTavern'].getContext = function () {
         registerHelper: () => { },
         registerMacro: MacrosParser.registerMacro.bind(MacrosParser),
         unregisterMacro: MacrosParser.unregisterMacro.bind(MacrosParser),
+        registerFunctionTool: ToolManager.registerFunctionTool.bind(ToolManager),
+        unregisterFunctionTool: ToolManager.unregisterFunctionTool.bind(ToolManager),
+        isToolCallingSupported: ToolManager.isToolCallingSupported.bind(ToolManager),
+        canPerformToolCalls: ToolManager.canPerformToolCalls.bind(ToolManager),
         registerDebugFunction: registerDebugFunction,
         /** @deprecated Use renderExtensionTemplateAsync instead. */
         renderExtensionTemplate: renderExtensionTemplate,

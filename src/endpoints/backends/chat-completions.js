@@ -4,7 +4,7 @@ const fetch = require('node-fetch').default;
 const { jsonParser } = require('../../express-common');
 const { CHAT_COMPLETION_SOURCES, GEMINI_SAFETY, BISON_SAFETY, OPENROUTER_HEADERS } = require('../../constants');
 const { forwardFetchResponse, getConfigValue, tryParse, uuidv4, mergeObjectWithYaml, excludeKeysByYaml, color } = require('../../util');
-const { convertClaudeMessages, convertGooglePrompt, convertTextCompletionPrompt, convertCohereMessages, convertMistralMessages, convertCohereTools, convertAI21Messages } = require('../../prompt-converters');
+const { convertClaudeMessages, convertGooglePrompt, convertTextCompletionPrompt, convertCohereMessages, convertMistralMessages, convertAI21Messages } = require('../../prompt-converters');
 const CohereStream = require('../../cohere-stream');
 
 const { readSecret, SECRET_KEYS } = require('../secrets');
@@ -130,7 +130,7 @@ async function sendClaudeRequest(request, response) {
                 convertedPrompt.messages.push({ role: 'user', content: '.' });
             }
             additionalHeaders['anthropic-beta'] = 'tools-2024-05-16';
-            requestBody.tool_choice = { type: request.body.tool_choice === 'required' ? 'any' : 'auto' };
+            requestBody.tool_choice = { type: request.body.tool_choice };
             requestBody.tools = request.body.tools
                 .filter(tool => tool.type === 'function')
                 .map(tool => tool.function)
@@ -483,7 +483,7 @@ async function sendMistralAIRequest(request, response) {
 
         if (Array.isArray(request.body.tools) && request.body.tools.length > 0) {
             requestBody['tools'] = request.body.tools;
-            requestBody['tool_choice'] = request.body.tool_choice === 'required' ? 'any' : 'auto';
+            requestBody['tool_choice'] = request.body.tool_choice;
         }
 
         const config = {
@@ -551,12 +551,6 @@ async function sendCohereRequest(request, response) {
             connectors.push({
                 id: 'web-search',
             });
-        }
-
-        if (Array.isArray(request.body.tools) && request.body.tools.length > 0) {
-            tools.push(...convertCohereTools(request.body.tools));
-            // Can't have both connectors and tools in the same request
-            connectors.splice(0, connectors.length);
         }
 
         // https://docs.cohere.com/reference/chat
@@ -914,18 +908,6 @@ router.post('/generate', jsonParser, function (request, response) {
         apiKey = readSecret(request.user.directories, SECRET_KEYS.GROQ);
         headers = {};
         bodyParams = {};
-
-        // 'required' tool choice is not supported by Groq
-        if (request.body.tool_choice === 'required') {
-            if (Array.isArray(request.body.tools) && request.body.tools.length > 0) {
-                request.body.tool_choice = request.body.tools.length > 1
-                    ? 'auto' :
-                    { type: 'function', function: { name: request.body.tools[0]?.function?.name } };
-
-            } else {
-                request.body.tool_choice = 'none';
-            }
-        }
     } else if (request.body.chat_completion_source === CHAT_COMPLETION_SOURCES.ZEROONEAI) {
         apiUrl = API_01AI;
         apiKey = readSecret(request.user.directories, SECRET_KEYS.ZEROONEAI);
@@ -962,7 +944,7 @@ router.post('/generate', jsonParser, function (request, response) {
         controller.abort();
     });
 
-    if (!isTextCompletion) {
+    if (!isTextCompletion && Array.isArray(request.body.tools) && request.body.tools.length > 0) {
         bodyParams['tools'] = request.body.tools;
         bodyParams['tool_choice'] = request.body.tool_choice;
     }
